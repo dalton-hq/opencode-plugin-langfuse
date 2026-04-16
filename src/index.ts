@@ -15,18 +15,16 @@ import { RandomIdGenerator } from "@opentelemetry/sdk-trace-base";
  * are 16-char hex. The random generator handles span IDs as usual.
  */
 class ParentAwareIdGenerator extends RandomIdGenerator {
-  private readonly parentTraceId: string | undefined;
-
   constructor() {
     super();
     const raw = process.env.LANGFUSE_TRACE_ID;
     if (raw && /^[0-9a-f]{32}$/i.test(raw)) {
-      this.parentTraceId = raw.toLowerCase();
+      const parentTraceId = raw.toLowerCase();
+      // RandomIdGenerator defines generateTraceId as a class field (arrow fn),
+      // so we reassign the field rather than using override.
+      const originalGenerate = this.generateTraceId.bind(this);
+      this.generateTraceId = () => parentTraceId ?? originalGenerate();
     }
-  }
-
-  override generateTraceId(): string {
-    return this.parentTraceId ?? super.generateTraceId();
   }
 }
 
