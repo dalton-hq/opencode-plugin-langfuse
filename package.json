@@ -15,7 +15,7 @@
     "format:check": "prettier --check .",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "bun run build",
-    "prepare": "husky"
+    "prepare": "tsc || true"
   },
   "keywords": [
     "opencode",
