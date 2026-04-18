@@ -1,5 +1,13 @@
 import { LangfuseSpanProcessor } from "@langfuse/otel";
 import type { Plugin } from "@opencode-ai/plugin";
+import {
+  context,
+  trace,
+  ROOT_CONTEXT,
+  type Context,
+  type SpanContext,
+} from "@opentelemetry/api";
+import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { NodeSDK } from "@opentelemetry/sdk-node";
 import { RandomIdGenerator } from "@opentelemetry/sdk-trace-base";
 
@@ -25,6 +33,30 @@ class ParentAwareIdGenerator extends RandomIdGenerator {
       const originalGenerate = this.generateTraceId.bind(this);
       this.generateTraceId = () => parentTraceId ?? originalGenerate();
     }
+  }
+}
+
+/**
+ * Context manager that returns a context with our remote parent span as the
+ * default when no other context is active.
+ *
+ * The Vercel AI SDK creates root spans via `tracer.startSpan()` without
+ * explicitly passing a parent. OTEL falls back to `context.active()` in that
+ * case. By overriding `active()` to return our parent context when the
+ * AsyncLocalStorage is empty, every otherwise-root span becomes a child of
+ * the snakur-2 parent observation.
+ */
+class ParentAwareContextManager extends AsyncLocalStorageContextManager {
+  private readonly defaultContext: Context;
+
+  constructor(defaultContext: Context) {
+    super();
+    this.defaultContext = defaultContext;
+  }
+
+  active(): Context {
+    const current = super.active();
+    return current === ROOT_CONTEXT ? this.defaultContext : current;
   }
 }
 
@@ -57,16 +89,49 @@ export const LangfusePlugin: Plugin = async ({ client }) => {
 
   const idGenerator = new ParentAwareIdGenerator();
   const parentTraceId = process.env.LANGFUSE_TRACE_ID;
+  const parentSpanId = process.env.LANGFUSE_PARENT_OBSERVATION_ID;
+
+  // Build a remote parent context when both trace and parent span IDs are
+  // provided via the environment. Every root span created by the Vercel AI
+  // SDK will be parented to this span, nesting the OpenCode subtree under
+  // the caller's observation in Langfuse.
+  let contextManager: AsyncLocalStorageContextManager | undefined;
+  let parentNested = false;
+  if (
+    parentTraceId &&
+    /^[0-9a-f]{32}$/i.test(parentTraceId) &&
+    parentSpanId &&
+    /^[0-9a-f]{16}$/i.test(parentSpanId)
+  ) {
+    const remoteParent: SpanContext = {
+      traceId: parentTraceId.toLowerCase(),
+      spanId: parentSpanId.toLowerCase(),
+      traceFlags: 1,
+      isRemote: true,
+    };
+    const parentContext = trace.setSpanContext(ROOT_CONTEXT, remoteParent);
+    contextManager = new ParentAwareContextManager(parentContext);
+    parentNested = true;
+  }
 
   const sdk = new NodeSDK({
     spanProcessors: [processor],
     idGenerator,
+    ...(contextManager ? { contextManager } : {}),
   });
 
   sdk.start();
 
-  if (parentTraceId) {
-    log("info", `OTEL tracing initialized → ${baseUrl} (stitching to parent trace ${parentTraceId.slice(0, 8)}…)`);
+  if (parentNested) {
+    log(
+      "info",
+      `OTEL tracing initialized → ${baseUrl} (nested under parent ${parentTraceId!.slice(0, 8)}…/${parentSpanId!.slice(0, 8)}…)`
+    );
+  } else if (parentTraceId) {
+    log(
+      "info",
+      `OTEL tracing initialized → ${baseUrl} (stitching to parent trace ${parentTraceId.slice(0, 8)}…)`
+    );
   } else {
     log("info", `OTEL tracing initialized → ${baseUrl}`);
   }
