@@ -1,7 +1,6 @@
 import { LangfuseSpanProcessor } from "@langfuse/otel";
 import type { Plugin } from "@opencode-ai/plugin";
 import {
-  context,
   trace,
   ROOT_CONTEXT,
   type Context,
@@ -9,7 +8,12 @@ import {
 } from "@opentelemetry/api";
 import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
 import { NodeSDK } from "@opentelemetry/sdk-node";
-import { RandomIdGenerator } from "@opentelemetry/sdk-trace-base";
+import {
+  RandomIdGenerator,
+  type ReadableSpan,
+  type Span,
+  type SpanProcessor,
+} from "@opentelemetry/sdk-trace-base";
 
 /**
  * Custom ID generator that reuses a parent trace ID from the environment.
@@ -60,6 +64,42 @@ class ParentAwareContextManager extends AsyncLocalStorageContextManager {
   }
 }
 
+const AI_SDK_PAYLOAD_ATTRIBUTES = [
+  "ai.prompt",
+  "ai.prompt.messages",
+  "ai.prompt.tools",
+  "ai.prompt.toolChoice",
+  "ai.response.text",
+  "ai.response.toolCalls",
+  "ai.response.object",
+];
+
+class PayloadScrubbingSpanProcessor implements SpanProcessor {
+  constructor(private readonly delegate: SpanProcessor) {}
+
+  onStart(span: Span, parentContext: Context): void {
+    this.delegate.onStart(span, parentContext);
+  }
+
+  onEnd(span: ReadableSpan): void {
+    if (span.name.startsWith("ai.")) {
+      const attributes = span.attributes as Record<string, unknown>;
+      for (const attribute of AI_SDK_PAYLOAD_ATTRIBUTES) {
+        delete attributes[attribute];
+      }
+    }
+    this.delegate.onEnd(span);
+  }
+
+  forceFlush(): Promise<void> {
+    return this.delegate.forceFlush();
+  }
+
+  shutdown(): Promise<void> {
+    return this.delegate.shutdown();
+  }
+}
+
 export const LangfusePlugin: Plugin = async ({ client }) => {
   const publicKey = process.env.LANGFUSE_PUBLIC_KEY;
   const secretKey = process.env.LANGFUSE_SECRET_KEY;
@@ -80,12 +120,13 @@ export const LangfusePlugin: Plugin = async ({ client }) => {
     return {};
   }
 
-  const processor = new LangfuseSpanProcessor({
+  const langfuseProcessor = new LangfuseSpanProcessor({
     publicKey,
     secretKey,
     baseUrl,
     environment,
   });
+  const processor = new PayloadScrubbingSpanProcessor(langfuseProcessor);
 
   const idGenerator = new ParentAwareIdGenerator();
   const parentTraceId = process.env.LANGFUSE_TRACE_ID;
