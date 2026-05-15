@@ -2,6 +2,9 @@ import { describe, it, expect, beforeEach, afterEach, mock } from "bun:test";
 import { LangfusePlugin } from "./index";
 
 const mockForceFlush = mock(() => Promise.resolve());
+const mockProcessorShutdown = mock(() => Promise.resolve());
+const mockOnStart = mock(() => {});
+const mockOnEnd = mock(() => {});
 const mockStart = mock(() => {});
 const mockShutdown = mock(() => Promise.resolve());
 
@@ -9,7 +12,10 @@ let capturedNodeSDKOptions: Record<string, unknown> = {};
 
 mock.module("@langfuse/otel", () => ({
   LangfuseSpanProcessor: mock(() => ({
+    onStart: mockOnStart,
+    onEnd: mockOnEnd,
     forceFlush: mockForceFlush,
+    shutdown: mockProcessorShutdown,
   })),
 }));
 
@@ -46,6 +52,9 @@ describe("LangfusePlugin", () => {
 
   beforeEach(() => {
     mockForceFlush.mockClear();
+    mockProcessorShutdown.mockClear();
+    mockOnStart.mockClear();
+    mockOnEnd.mockClear();
     mockStart.mockClear();
     mockShutdown.mockClear();
     mockLog.mockClear();
@@ -173,6 +182,46 @@ describe("LangfusePlugin", () => {
       } as any);
 
       expect(mockForceFlush).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("payload scrubbing", () => {
+    it("removes AI SDK prompt and response payload attributes before export", async () => {
+      setupEnv();
+      await LangfusePlugin(mockPluginInput());
+
+      const [processor] = capturedNodeSDKOptions.spanProcessors as any[];
+      const span = {
+        name: "ai.streamText.doStream",
+        attributes: {
+          "ai.prompt": '{"prompt":"large"}',
+          "ai.prompt.messages": '[{"role":"user","content":"large"}]',
+          "ai.prompt.tools": '[{"name":"bash"}]',
+          "ai.prompt.toolChoice": '{"type":"auto"}',
+          "ai.response.text": "large response",
+          "ai.response.toolCalls": '[{"toolName":"bash"}]',
+          "ai.response.object": '{"result":"large"}',
+          "ai.usage.totalTokens": 42,
+          "gen_ai.usage.input_tokens": 21,
+          "gen_ai.response.model": "gemini-3-flash-preview",
+        },
+      };
+
+      processor.onEnd(span);
+
+      expect(span.attributes["ai.prompt"]).toBeUndefined();
+      expect(span.attributes["ai.prompt.messages"]).toBeUndefined();
+      expect(span.attributes["ai.prompt.tools"]).toBeUndefined();
+      expect(span.attributes["ai.prompt.toolChoice"]).toBeUndefined();
+      expect(span.attributes["ai.response.text"]).toBeUndefined();
+      expect(span.attributes["ai.response.toolCalls"]).toBeUndefined();
+      expect(span.attributes["ai.response.object"]).toBeUndefined();
+      expect(span.attributes["ai.usage.totalTokens"]).toBe(42);
+      expect(span.attributes["gen_ai.usage.input_tokens"]).toBe(21);
+      expect(span.attributes["gen_ai.response.model"]).toBe(
+        "gemini-3-flash-preview"
+      );
+      expect(mockOnEnd).toHaveBeenCalledWith(span);
     });
   });
 
