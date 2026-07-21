@@ -1,5 +1,17 @@
-import { describe, it, expect, beforeEach, afterEach, mock } from "bun:test";
-import { LangfusePlugin } from "./index";
+import {
+  describe,
+  it,
+  expect,
+  beforeEach,
+  afterEach,
+  afterAll,
+  mock,
+} from "bun:test";
+import {
+  LangfusePlugin,
+  flushAndShutdown,
+  __resetSignalFlushForTests,
+} from "./index";
 
 const mockForceFlush = mock(() => Promise.resolve());
 const mockStart = mock(() => {});
@@ -45,11 +57,16 @@ describe("LangfusePlugin", () => {
   const originalEnv = { ...process.env };
 
   beforeEach(() => {
+    __resetSignalFlushForTests();
     mockForceFlush.mockClear();
     mockStart.mockClear();
     mockShutdown.mockClear();
     mockLog.mockClear();
     capturedNodeSDKOptions = {};
+  });
+
+  afterAll(() => {
+    __resetSignalFlushForTests();
   });
 
   afterEach(() => {
@@ -245,6 +262,69 @@ describe("LangfusePlugin", () => {
           message: "OTEL tracing initialized → https://cloud.langfuse.com",
         },
       });
+    });
+  });
+
+  describe("shutdown flush (ENG-3645)", () => {
+    it("registers SIGTERM and SIGINT handlers on init", async () => {
+      setupEnv();
+      const termBefore = process.listeners("SIGTERM").length;
+      const intBefore = process.listeners("SIGINT").length;
+
+      await LangfusePlugin(mockPluginInput());
+
+      expect(process.listeners("SIGTERM").length).toBe(termBefore + 1);
+      expect(process.listeners("SIGINT").length).toBe(intBefore + 1);
+    });
+
+    it("flushes batched spans, then shuts the exporter down, on shutdown", async () => {
+      setupEnv();
+      await LangfusePlugin(mockPluginInput());
+
+      await flushAndShutdown("SIGTERM");
+
+      expect(mockForceFlush).toHaveBeenCalled();
+      expect(mockShutdown).toHaveBeenCalled();
+    });
+
+    it("flushes and shuts down at most once across repeated triggers", async () => {
+      setupEnv();
+      await LangfusePlugin(mockPluginInput());
+
+      await flushAndShutdown("SIGTERM");
+      await flushAndShutdown("SIGINT");
+      await flushAndShutdown("server.instance.disposed");
+
+      expect(mockForceFlush).toHaveBeenCalledTimes(1);
+      expect(mockShutdown).toHaveBeenCalledTimes(1);
+    });
+
+    it("registers nothing and flushes nothing when credentials are missing", async () => {
+      delete process.env.LANGFUSE_PUBLIC_KEY;
+      delete process.env.LANGFUSE_SECRET_KEY;
+      const termBefore = process.listeners("SIGTERM").length;
+
+      await LangfusePlugin(mockPluginInput());
+
+      expect(process.listeners("SIGTERM").length).toBe(termBefore);
+      // Must be safe to call with nothing registered.
+      await flushAndShutdown("SIGTERM");
+      expect(mockForceFlush).not.toHaveBeenCalled();
+    });
+
+    it("does not terminate the process (OpenCode still owns the grace window)", async () => {
+      setupEnv();
+      await LangfusePlugin(mockPluginInput());
+      const exitSpy = mock((() => undefined) as (code?: number) => never);
+      const originalExit = process.exit;
+      process.exit = exitSpy as unknown as typeof process.exit;
+      try {
+        await flushAndShutdown("SIGTERM");
+      } finally {
+        process.exit = originalExit;
+      }
+
+      expect(exitSpy).not.toHaveBeenCalled();
     });
   });
 });
