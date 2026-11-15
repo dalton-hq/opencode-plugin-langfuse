@@ -179,6 +179,8 @@ export const LangfusePlugin: Plugin = async ({ client }) => {
     secretKey,
     baseUrl,
     environment,
+    // Export every OpenCode span, not only the LLM spans Langfuse keeps by default.
+    shouldExportSpan: () => true,
   });
 
   const idGenerator = new ParentAwareIdGenerator();
